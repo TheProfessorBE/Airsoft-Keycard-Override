@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//c/Dropbox/Projects/Airsoft/2026 - RFID Test/rfid_demo/**)",
+      "Read(//c/Users/janst/Documents/Arduino/libraries/RFID_MFRC522v2/**)"
+    ]
+  }
+}

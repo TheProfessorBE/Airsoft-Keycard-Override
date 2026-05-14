@@ -322,8 +322,9 @@ void updateLEDs() {
 // ════════════════════════════════════════════════════════════════
 
 void updateDisplays() {
-  disp.showNumber(redScore,  true, 3, 0);
-  disp.showNumber(blueScore, true, 3, 3);
+  disp.showNumber(redScore,  true, 2, 0);
+  disp.showString("  ", 2, 2);
+  disp.showNumber(blueScore, true, 2, 4);
 }
 
 // ════════════════════════════════════════════════════════════════

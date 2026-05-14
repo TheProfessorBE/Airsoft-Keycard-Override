@@ -31,7 +31,7 @@
 #define DEF_CAPTURE_SECS      5
 #define DEF_CLAIM_SECS        5
 #define DEF_POST_SCORE_SECS   8
-#define DEF_NUM_LEDS         16
+#define DEF_NUM_LEDS         24
 #define DEF_BRIGHTNESS      100
 #define DEF_CARD_TIMEOUT_MS 700
 #define DEF_POLL_MS         100
@@ -42,6 +42,8 @@
 #define PIN_LED        4
 #define PIN_DISP_CLK  26
 #define PIN_DISP_DIO  27
+#define PIN_BUZZER_A  32   // buzzer + terminal
+#define PIN_BUZZER_B  33   // buzzer − terminal (push-pull; wire here instead of GND)
 
 // ─── Capacity ─────────────────────────────────────────────────
 #define MAX_LEDS           60
@@ -66,7 +68,7 @@ CRGB                   leds[MAX_LEDS];
 TM1637TinyDisplay6     disp(PIN_DISP_CLK, PIN_DISP_DIO);
 Preferences            prefs;
 
-// ─── Runtime settings ─────────────────────────────────────────
+// ─── Runtime settings ─────────────────────────────────────────²  ²                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 
 uint8_t  g_capture_secs    = DEF_CAPTURE_SECS;
 uint8_t  g_claim_secs      = DEF_CLAIM_SECS;
 uint8_t  g_post_score_secs = DEF_POST_SCORE_SECS;
@@ -325,6 +327,65 @@ void updateDisplays() {
 }
 
 // ════════════════════════════════════════════════════════════════
+//  AUDIO
+// ════════════════════════════════════════════════════════════════
+
+#define BEEP_HZ 2000  // resonant frequency of this buzzer
+
+// Push-pull tone: drives A and B in opposite phase, doubling voltage across piezo.
+// Both pins go LOW after the tone to avoid a static DC charge on the element.
+static void tonePlay(uint32_t ms) {
+  const uint32_t half = 500000UL / BEEP_HZ;  // half-period in µs (250 µs @ 2000 Hz)
+  const uint32_t end  = millis() + ms;
+  while (millis() < end) {
+    digitalWrite(PIN_BUZZER_A, HIGH);
+    digitalWrite(PIN_BUZZER_B, LOW);
+    delayMicroseconds(half);
+    digitalWrite(PIN_BUZZER_A, LOW);
+    digitalWrite(PIN_BUZZER_B, HIGH);
+    delayMicroseconds(half);
+  }
+  digitalWrite(PIN_BUZZER_A, LOW);
+  digitalWrite(PIN_BUZZER_B, LOW);
+}
+
+void beepCardAccepted() {
+  tonePlay(100); delay(50);
+  tonePlay(100);
+}
+
+void beepCardRejected() {
+  tonePlay(60); delay(30);
+  tonePlay(60); delay(30);
+  tonePlay(60);
+}
+
+void beepClaimed() {
+  tonePlay(80);  delay(40);
+  tonePlay(120); delay(40);
+  tonePlay(250);
+}
+
+void beepScored() {
+  tonePlay(80); delay(30);
+  tonePlay(80); delay(30);
+  tonePlay(80); delay(30);
+  tonePlay(80); delay(30);
+  tonePlay(400);
+}
+
+void beepAborted() {
+  tonePlay(200); delay(40);
+  tonePlay(80);
+}
+
+void beepReset() {
+  for (int i = 0; i < 6; i++) {
+    tonePlay(60); delay(30);
+  }
+}
+
+// ════════════════════════════════════════════════════════════════
 //  GAME LOGIC
 // ════════════════════════════════════════════════════════════════
 
@@ -335,6 +396,7 @@ void scorePoint(uint8_t team) {
   heldUIDLen = 0;
   phaseStart = millis();
   gameState  = POST_SCORE;
+  beepScored();
 }
 
 void startClaim(uint8_t toTeam) {
@@ -361,34 +423,42 @@ void handleCard() {
   if (now - lastCardMillis < 500) return;
   lastCardMillis = now;
 
-  if (cardMatchAny(CT_ADMIN)) { resetGame(); return; }
+  if (cardMatchAny(CT_ADMIN)) { resetGame(); beepReset(); return; }
+
+  bool actionTaken = false;
 
   switch (gameState) {
 
     case NEUTRAL:
-      if      (cardMatchAny(CT_RED_CLAIM))  startClaim(1);
-      else if (cardMatchAny(CT_BLUE_CLAIM)) startClaim(2);
+      if      (cardMatchAny(CT_RED_CLAIM))  { startClaim(1); actionTaken = true; }
+      else if (cardMatchAny(CT_BLUE_CLAIM)) { startClaim(2); actionTaken = true; }
       break;
 
     case CLAIMED_RED:
-      if      (cardMatchAny(CT_RED_CAPTURE)) { gameState = RED_CAPTURING;  phaseStart = now; saveHeld(); }
-      else if (cardMatchAny(CT_BLUE_CLAIM))    startClaim(2);
+      if      (cardMatchAny(CT_RED_CAPTURE)) { gameState = RED_CAPTURING;  phaseStart = now; saveHeld(); actionTaken = true; }
+      else if (cardMatchAny(CT_BLUE_CLAIM))  { startClaim(2); actionTaken = true; }
       break;
 
     case CLAIMED_BLUE:
-      if      (cardMatchAny(CT_BLUE_CAPTURE)) { gameState = BLUE_CAPTURING; phaseStart = now; saveHeld(); }
-      else if (cardMatchAny(CT_RED_CLAIM))      startClaim(1);
+      if      (cardMatchAny(CT_BLUE_CAPTURE)) { gameState = BLUE_CAPTURING; phaseStart = now; saveHeld(); actionTaken = true; }
+      else if (cardMatchAny(CT_RED_CLAIM))    { startClaim(1); actionTaken = true; }
       break;
 
     case RED_CAPTURING:
-      if (cardMatchAny(CT_BLUE_CLAIM)) startClaim(2);
+      if (cardMatchAny(CT_BLUE_CLAIM)) { startClaim(2); actionTaken = true; }
       break;
 
     case BLUE_CAPTURING:
-      if (cardMatchAny(CT_RED_CLAIM)) startClaim(1);
+      if (cardMatchAny(CT_RED_CLAIM)) { startClaim(1); actionTaken = true; }
       break;
 
     default: break;
+  }
+
+  if (actionTaken) {
+    beepCardAccepted();
+  } else if (findCard(rfid.uid.uidByte, rfid.uid.size) >= 0) {
+    beepCardRejected();
   }
 }
 
@@ -627,6 +697,10 @@ void setup() {
 
   SPI.begin();
   pinMode(PIN_RC522_RST, OUTPUT);
+  pinMode(PIN_BUZZER_A, OUTPUT);
+  pinMode(PIN_BUZZER_B, OUTPUT);
+  digitalWrite(PIN_BUZZER_A, LOW);
+  digitalWrite(PIN_BUZZER_B, LOW);
   digitalWrite(PIN_RC522_RST, HIGH);
   delay(10);
   rfid.PCD_Init();
@@ -707,6 +781,7 @@ void loop() {
       else                                                     gameState = CLAIMED_BLUE;
       phaseStart = now;
       heldUIDLen = 0;
+      beepAborted();
     }
   }
 
@@ -716,6 +791,7 @@ void loop() {
     gameState  = (claimingToTeam == 1) ? CLAIMED_RED : CLAIMED_BLUE;
     phaseStart = now;
     heldUIDLen = 0;
+    beepClaimed();
   }
 
   // Capture complete → score

@@ -3,7 +3,10 @@
     "allow": [
       "Read(//c/Dropbox/Projects/Airsoft/2026 - RFID Test/rfid_demo/**)",
       "Read(//c/Users/janst/Documents/Arduino/libraries/RFID_MFRC522v2/**)",
-      "Read(//c/Dropbox/Projects/Airsoft/2026 - Hack The Powerplant/**)"
+      "Read(//c/Dropbox/Projects/Airsoft/2026 - Hack The Powerplant/**)",
+      "Bash(git add *)",
+      "Bash(git update-index *)",
+      "Bash(git hash-object *)"
     ]
   }
 }

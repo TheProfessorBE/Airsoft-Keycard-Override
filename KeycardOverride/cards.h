@@ -14,10 +14,12 @@ const CardDef BLUE_CLAIM_CARDS[] = {
   {{ 0x97,0xC6,0x7A,0x33 }, 4},
 };
 
-const CardDef BLUE_CAPTURE_CARDS[] = {how 
+const CardDef BLUE_CAPTURE_CARDS[] = {
   {{ 0x3A,0x65,0x0B,0x35 }, 4},
 };
 
-const CardDef ADMIN_CARDS[] = {
+// Was ADMIN_CARDS — now only the reset card lives here.
+// Score and duration admin cards have no defaults; teach-in via serial menu.
+const CardDef ADMIN_RESET_CARDS[] = {
   {{ 0xEA,0x0E,0xCA,0x35 }, 4},
 };

@@ -2,20 +2,25 @@
  * Keycard Override — ESP32 RFID objective box firmware
  *
  * Hardware:
- *   ESP32-WROOM-32 (30 pin), RC522 RFID reader (SPI),
- *   WS2812B LED strip, TM1637 6-digit display
+ *   ESP32-WROOM-32 (30 pin), RC522 RFID (SPI),
+ *   WS2812B LED strip, TM1637 6-digit display,
+ *   push-pull piezo buzzer, DFPlayer Mini (HardwareSerial2)
  *
- * Libraries:
- *   RFID_MFRC522v2, FastLED, TM1637TinyDisplay (AKJ7)
+ * Card types (12 total):
+ *   0  Red CLAIM       — hold → sweep LEDs to red
+ *   1  Red CAPTURE     — hold → bar fills → +1 red
+ *   2  Blue CLAIM      — hold → sweep LEDs to blue
+ *   3  Blue CAPTURE    — hold → bar fills → +1 blue
+ *   4  Admin RESET     — tap  → scores reset to 0
+ *   5  Admin RED+      — hold 3 s → red score +1
+ *   6  Admin RED-      — hold 3 s → red score −1
+ *   7  Admin BLUE+     — hold 3 s → blue score +1
+ *   8  Admin BLUE-     — hold 3 s → blue score −1
+ *   9  Admin DUR-2s    — hold 3 s → game hold duration = 2 s
+ *  10  Admin DUR-5s    — hold 3 s → game hold duration = 5 s
+ *  11  Admin DUR-8s    — hold 3 s → game hold duration = 8 s
  *
- * Game flow:
- *   1. Neutral (yellow). Either team can claim.
- *   2. Hold claim card 5s → objective claimed (team color breathing).
- *   3. Hold capture card 5s → bar fills → +1 point → back to neutral.
- *   4. Opposing claim card held 5s → sweeps to new team → claimed by them.
- *   5. Card removed mid-action → action cancelled.
- *
- * Config: send 'M' via Serial Monitor (115200 baud, Newline) to open menu.
+ * Config: send 'M' via Serial Monitor (115200 baud, Newline).
  * First boot loads defaults from cards.h; all changes saved to NVS.
  */
 
@@ -30,8 +35,7 @@
 #include "audio_library.h"
 
 // ─── Compile-time defaults (first boot / factory reset) ──────
-#define DEF_CAPTURE_SECS      5
-#define DEF_CLAIM_SECS        5
+#define DEF_HOLD_SECS         5     // CLAIMING & CAPTURING duration — 2, 5, or 8 only
 #define DEF_POST_SCORE_SECS   8
 #define DEF_NUM_LEDS         24
 #define DEF_BRIGHTNESS      100
@@ -45,22 +49,29 @@
 #define PIN_DISP_CLK  26
 #define PIN_DISP_DIO  27
 #define PIN_BUZZER_A  32   // buzzer + terminal
-#define PIN_BUZZER_B  33   // buzzer − terminal (push-pull; wire here instead of GND)
+#define PIN_BUZZER_B  33   // buzzer − terminal (push-pull; NOT to GND)
 #define PIN_DFP_RX    17   // ESP32 RX ← DFPlayer TX
-#define PIN_DFP_TX    16   // ESP32 TX → DFPlayer RX (via 1 kΩ resistor)
+#define PIN_DFP_TX    16   // ESP32 TX → DFPlayer RX (via 1 kΩ)
 #define DFPLAYER_VOL  25   // 0–30
 
 // ─── Capacity ─────────────────────────────────────────────────
 #define MAX_LEDS           60
 #define MAX_CARDS_PER_TYPE 10
-#define NUM_CARD_TYPES      5
+#define NUM_CARD_TYPES     12
 
 // ─── Card type indices ────────────────────────────────────────
-#define CT_RED_CLAIM    0
-#define CT_RED_CAPTURE  1
-#define CT_BLUE_CLAIM   2
-#define CT_BLUE_CAPTURE 3
-#define CT_ADMIN        4
+#define CT_RED_CLAIM        0
+#define CT_RED_CAPTURE      1
+#define CT_BLUE_CLAIM       2
+#define CT_BLUE_CAPTURE     3
+#define CT_ADMIN_RESET      4   // tap  → immediate game reset
+#define CT_ADMIN_RED_PLUS   5   // hold 3 s → red score +1
+#define CT_ADMIN_RED_MINUS  6   // hold 3 s → red score −1
+#define CT_ADMIN_BLUE_PLUS  7   // hold 3 s → blue score +1
+#define CT_ADMIN_BLUE_MINUS 8   // hold 3 s → blue score −1
+#define CT_ADMIN_DUR_2      9   // hold 3 s → set hold duration to 2 s
+#define CT_ADMIN_DUR_5     10   // hold 3 s → set hold duration to 5 s
+#define CT_ADMIN_DUR_8     11   // hold 3 s → set hold duration to 8 s
 
 // cards.h defines CardDef struct + default arrays (first-boot values)
 #include "cards.h"
@@ -76,9 +87,8 @@ HardwareSerial         dfSerial(2);
 DFRobotDFPlayerMini    dfPlayer;
 AirsoftAudio           audio(dfPlayer);
 
-// ─── Runtime settings ─────────────────────────────────────────²  ²                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 
-uint8_t  g_capture_secs    = DEF_CAPTURE_SECS;
-uint8_t  g_claim_secs      = DEF_CLAIM_SECS;
+// ─── Runtime settings ─────────────────────────────────────────
+uint8_t  g_hold_secs       = DEF_HOLD_SECS;   // duration for CLAIMING and CAPTURING
 uint8_t  g_post_score_secs = DEF_POST_SCORE_SECS;
 uint8_t  g_num_leds        = DEF_NUM_LEDS;
 uint8_t  g_brightness      = DEF_BRIGHTNESS;
@@ -89,17 +99,33 @@ uint16_t g_poll_ms         = DEF_POLL_MS;
 CardDef  g_cards[NUM_CARD_TYPES][MAX_CARDS_PER_TYPE];
 uint8_t  g_card_count[NUM_CARD_TYPES] = {};
 
-const char* TYPE_NAMES[]   = { "Red CLAIM", "Red CAPTURE", "Blue CLAIM", "Blue CAPTURE", "Admin" };
-const char* NVS_PREFIXES[] = { "rc", "rp", "bc", "bp", "ad" };
+const char* TYPE_NAMES[] = {
+  "Red CLAIM", "Red CAPTURE", "Blue CLAIM", "Blue CAPTURE",
+  "Admin RESET",
+  "Admin RED+", "Admin RED-", "Admin BLUE+", "Admin BLUE-",
+  "Admin DUR-2s", "Admin DUR-5s", "Admin DUR-8s"
+};
+
+// NVS key prefixes — 2 chars each, must be unique
+const char* NVS_PREFIXES[] = {
+  "rc", "rx", "bc", "bx",          // game cards
+  "as", "rp", "rm", "bp", "bm",    // admin tap + score
+  "d3", "d6", "d9"                  // admin duration
+};
 
 // ─── Colors ───────────────────────────────────────────────────
 const CRGB COL_YELLOW = CRGB(255, 160,   0);
 const CRGB COL_RED    = CRGB(255,   0,   0);
 const CRGB COL_BLUE   = CRGB(  0,   0, 255);
+const CRGB COL_PURPLE = CRGB(128,   0, 255);
 
 // ─── Game state ───────────────────────────────────────────────
-// (declared here so card helpers below can reference these vars)
-enum State { NEUTRAL, CLAIMED_RED, CLAIMED_BLUE, RED_CAPTURING, BLUE_CAPTURING, CLAIMING, POST_SCORE };
+enum State {
+  NEUTRAL, CLAIMED_RED, CLAIMED_BLUE,
+  RED_CAPTURING, BLUE_CAPTURING,
+  CLAIMING, POST_SCORE,
+  ADMIN_HOLD   // processing a hold-type admin card
+};
 
 State         gameState        = NEUTRAL;
 uint8_t       redScore         = 0;
@@ -118,14 +144,23 @@ bool          inMenu           = false;
 bool          dfPlayerReady    = false;
 unsigned long lastVoiceMs      = 0;
 
+// ─── Admin hold state ─────────────────────────────────────────
+State         savedState        = NEUTRAL;
+unsigned long savedPhaseStart   = 0;
+uint8_t       savedClaimingTo   = 0;
+uint8_t       savedClaimingFrom = 0;
+byte          savedHeldUID[10]  = {};
+byte          savedHeldUIDLen   = 0;
+uint8_t       adminCardType     = 0;
+bool          adminActionDone   = false;
+
 // ════════════════════════════════════════════════════════════════
 //  NVS
 // ════════════════════════════════════════════════════════════════
 
 void nvsSaveSettings() {
   prefs.begin("ko", false);
-  prefs.putUChar("cap",  g_capture_secs);
-  prefs.putUChar("clm",  g_claim_secs);
+  prefs.putUChar("hld",  g_hold_secs);
   prefs.putUChar("pst",  g_post_score_secs);
   prefs.putUChar("leds", g_num_leds);
   prefs.putUChar("bri",  g_brightness);
@@ -136,11 +171,10 @@ void nvsSaveSettings() {
 
 void nvsLoadSettings() {
   prefs.begin("ko", true);
-  g_capture_secs    = prefs.getUChar("cap",   DEF_CAPTURE_SECS);
-  g_claim_secs      = prefs.getUChar("clm",   DEF_CLAIM_SECS);
-  g_post_score_secs = prefs.getUChar("pst",   DEF_POST_SCORE_SECS);
-  g_num_leds        = prefs.getUChar("leds",  DEF_NUM_LEDS);
-  g_brightness      = prefs.getUChar("bri",   DEF_BRIGHTNESS);
+  g_hold_secs       = prefs.getUChar("hld",  DEF_HOLD_SECS);
+  g_post_score_secs = prefs.getUChar("pst",  DEF_POST_SCORE_SECS);
+  g_num_leds        = prefs.getUChar("leds", DEF_NUM_LEDS);
+  g_brightness      = prefs.getUChar("bri",  DEF_BRIGHTNESS);
   g_card_timeout_ms = prefs.getUShort("ctmo", DEF_CARD_TIMEOUT_MS);
   g_poll_ms         = prefs.getUShort("poll", DEF_POLL_MS);
   prefs.end();
@@ -188,8 +222,7 @@ void copyDefaultCards(uint8_t t, const CardDef* src, uint8_t count) {
 }
 
 void nvsFactoryReset() {
-  g_capture_secs    = DEF_CAPTURE_SECS;
-  g_claim_secs      = DEF_CLAIM_SECS;
+  g_hold_secs       = DEF_HOLD_SECS;
   g_post_score_secs = DEF_POST_SCORE_SECS;
   g_num_leds        = DEF_NUM_LEDS;
   g_brightness      = DEF_BRIGHTNESS;
@@ -201,7 +234,9 @@ void nvsFactoryReset() {
   copyDefaultCards(CT_RED_CAPTURE,  RED_CAPTURE_CARDS,  sizeof(RED_CAPTURE_CARDS)  / sizeof(CardDef));
   copyDefaultCards(CT_BLUE_CLAIM,   BLUE_CLAIM_CARDS,   sizeof(BLUE_CLAIM_CARDS)   / sizeof(CardDef));
   copyDefaultCards(CT_BLUE_CAPTURE, BLUE_CAPTURE_CARDS, sizeof(BLUE_CAPTURE_CARDS) / sizeof(CardDef));
-  copyDefaultCards(CT_ADMIN,        ADMIN_CARDS,        sizeof(ADMIN_CARDS)        / sizeof(CardDef));
+  copyDefaultCards(CT_ADMIN_RESET,  ADMIN_RESET_CARDS,  sizeof(ADMIN_RESET_CARDS)  / sizeof(CardDef));
+  for (uint8_t t = CT_ADMIN_RED_PLUS; t < NUM_CARD_TYPES; t++)
+    g_card_count[t] = 0;
   nvsSaveCards();
 
   prefs.begin("ko", false);
@@ -293,7 +328,7 @@ void updateLEDs() {
     case BLUE_CAPTURING: {
       CRGB teamCol = (gameState == RED_CAPTURING) ? COL_RED : COL_BLUE;
       uint8_t lit  = (uint8_t)((unsigned long)elapsed * g_num_leds
-                               / ((unsigned long)g_capture_secs * 1000));
+                               / ((unsigned long)g_hold_secs * 1000));
       if (lit > g_num_leds) lit = g_num_leds;
       uint8_t sparkBri = beatsin8(90, 0, 255);
       for (int i = 0; i < g_num_leds; i++) {
@@ -309,7 +344,7 @@ void updateLEDs() {
       CRGB oldCol = (claimingFromTeam == 1) ? COL_RED  :
                     (claimingFromTeam == 2) ? COL_BLUE : COL_YELLOW;
       uint8_t lit = (uint8_t)((unsigned long)elapsed * g_num_leds
-                              / ((unsigned long)g_claim_secs * 1000));
+                              / ((unsigned long)g_hold_secs * 1000));
       if (lit > g_num_leds) lit = g_num_leds;
       for (int i = 0; i < g_num_leds; i++)
         leds[i] = (i < lit) ? newCol : oldCol;
@@ -320,6 +355,17 @@ void updateLEDs() {
       CRGB col = (lastScorer == 1) ? COL_RED : COL_BLUE;
       bool on  = (elapsed / 150) % 2 == 0;
       fill_solid(leds, g_num_leds, on ? col : CRGB::Black);
+      break;
+    }
+
+    case ADMIN_HOLD: {
+      // Purple progress bar for 3 s hold; full purple while waiting for card removal
+      uint8_t lit = adminActionDone
+        ? g_num_leds
+        : (uint8_t)((unsigned long)elapsed * g_num_leds / 3000UL);
+      if (lit > g_num_leds) lit = g_num_leds;
+      for (int i = 0; i < g_num_leds; i++)
+        leds[i] = (i < lit) ? COL_PURPLE : CRGB::Black;
       break;
     }
   }
@@ -338,63 +384,29 @@ void updateDisplays() {
 }
 
 // ════════════════════════════════════════════════════════════════
-//  AUDIO
+//  BUZZER
 // ════════════════════════════════════════════════════════════════
 
-#define BEEP_HZ 2000  // resonant frequency of this buzzer
+#define BEEP_HZ 2000
 
-// Push-pull tone: drives A and B in opposite phase, doubling voltage across piezo.
-// Both pins go LOW after the tone to avoid a static DC charge on the element.
 static void tonePlay(uint32_t ms) {
-  const uint32_t half = 500000UL / BEEP_HZ;  // half-period in µs (250 µs @ 2000 Hz)
+  const uint32_t half = 500000UL / BEEP_HZ;
   const uint32_t end  = millis() + ms;
   while (millis() < end) {
-    digitalWrite(PIN_BUZZER_A, HIGH);
-    digitalWrite(PIN_BUZZER_B, LOW);
+    digitalWrite(PIN_BUZZER_A, HIGH); digitalWrite(PIN_BUZZER_B, LOW);
     delayMicroseconds(half);
-    digitalWrite(PIN_BUZZER_A, LOW);
-    digitalWrite(PIN_BUZZER_B, HIGH);
+    digitalWrite(PIN_BUZZER_A, LOW);  digitalWrite(PIN_BUZZER_B, HIGH);
     delayMicroseconds(half);
   }
-  digitalWrite(PIN_BUZZER_A, LOW);
-  digitalWrite(PIN_BUZZER_B, LOW);
+  digitalWrite(PIN_BUZZER_A, LOW); digitalWrite(PIN_BUZZER_B, LOW);
 }
 
-void beepCardAccepted() {
-  tonePlay(100); delay(50);
-  tonePlay(100);
-}
-
-void beepCardRejected() {
-  tonePlay(60); delay(30);
-  tonePlay(60); delay(30);
-  tonePlay(60);
-}
-
-void beepClaimed() {
-  tonePlay(80);  delay(40);
-  tonePlay(120); delay(40);
-  tonePlay(250);
-}
-
-void beepScored() {
-  tonePlay(80); delay(30);
-  tonePlay(80); delay(30);
-  tonePlay(80); delay(30);
-  tonePlay(80); delay(30);
-  tonePlay(400);
-}
-
-void beepAborted() {
-  tonePlay(200); delay(40);
-  tonePlay(80);
-}
-
-void beepReset() {
-  for (int i = 0; i < 6; i++) {
-    tonePlay(60); delay(30);
-  }
-}
+void beepCardAccepted() { tonePlay(100); delay(50); tonePlay(100); }
+void beepCardRejected() { tonePlay(60); delay(30); tonePlay(60); delay(30); tonePlay(60); }
+void beepClaimed()      { tonePlay(80); delay(40); tonePlay(120); delay(40); tonePlay(250); }
+void beepScored()       { for (int i=0;i<4;i++){tonePlay(80);delay(30);} tonePlay(400); }
+void beepAborted()      { tonePlay(200); delay(40); tonePlay(80); }
+void beepReset()        { for (int i=0;i<6;i++){tonePlay(60);delay(30);} }
 
 // ════════════════════════════════════════════════════════════════
 //  AUDIO VOICE
@@ -404,9 +416,9 @@ void playStatusVoice() {
   if (!dfPlayerReady) return;
   lastVoiceMs = millis();
   switch (gameState) {
-    case NEUTRAL:       audio.playRandom(AudioClip::THE_TERMINAL_IS_NEUTRAL);                break;
-    case CLAIMED_RED:   audio.playRandom(AudioClip::THE_TERMINAL_IS_CLAIMED_BY_THE_RED_TEAM);  break;
-    case CLAIMED_BLUE:  audio.playRandom(AudioClip::THE_TERMINAL_IS_CLAIMED_BY_THE_BLUE_TEAM); break;
+    case NEUTRAL:      audio.playRandom(AudioClip::THE_TERMINAL_IS_NEUTRAL);                    break;
+    case CLAIMED_RED:  audio.playRandom(AudioClip::THE_TERMINAL_IS_CLAIMED_BY_THE_RED_TEAM);    break;
+    case CLAIMED_BLUE: audio.playRandom(AudioClip::THE_TERMINAL_IS_CLAIMED_BY_THE_BLUE_TEAM);   break;
     case POST_SCORE:
       if (lastScorer == 1) audio.playRandom(AudioClip::THE_TERMINAL_IS_CAPTURED_BY_THE_RED_TEAM);
       else                 audio.playRandom(AudioClip::THE_TERMINAL_IS_CAPTURED_BY_THE_BLUE_TEAM);
@@ -434,6 +446,16 @@ void playLeadVoice() {
 // ════════════════════════════════════════════════════════════════
 //  GAME LOGIC
 // ════════════════════════════════════════════════════════════════
+
+// Blocking purple-blink confirmation used after setting hold duration
+void blinkDurationConfirm(uint8_t n) {
+  for (int r = 0; r < 4; r++) {
+    fill_solid(leds, g_num_leds, CRGB::Black);
+    for (int i = 0; i < n && i < g_num_leds; i++) leds[i] = COL_PURPLE;
+    FastLED.show(); delay(300);
+    fill_solid(leds, g_num_leds, CRGB::Black); FastLED.show(); delay(200);
+  }
+}
 
 void scorePoint(uint8_t team) {
   if (team == 1) redScore++;
@@ -465,17 +487,98 @@ void resetGame() {
   gameState  = NEUTRAL;
 }
 
+void executeAdminHold() {
+  switch (adminCardType) {
+    case CT_ADMIN_RED_PLUS:
+      redScore++;
+      Serial.print(F("Admin: red score → ")); Serial.println(redScore);
+      beepScored();
+      break;
+    case CT_ADMIN_RED_MINUS:
+      if (redScore > 0) redScore--;
+      Serial.print(F("Admin: red score → ")); Serial.println(redScore);
+      beepAborted();
+      break;
+    case CT_ADMIN_BLUE_PLUS:
+      blueScore++;
+      Serial.print(F("Admin: blue score → ")); Serial.println(blueScore);
+      beepScored();
+      break;
+    case CT_ADMIN_BLUE_MINUS:
+      if (blueScore > 0) blueScore--;
+      Serial.print(F("Admin: blue score → ")); Serial.println(blueScore);
+      beepAborted();
+      break;
+    case CT_ADMIN_DUR_2:
+      g_hold_secs = 2; nvsSaveSettings();
+      Serial.println(F("Admin: hold duration → 2 s"));
+      blinkDurationConfirm(2);
+      break;
+    case CT_ADMIN_DUR_5:
+      g_hold_secs = 5; nvsSaveSettings();
+      Serial.println(F("Admin: hold duration → 5 s"));
+      blinkDurationConfirm(5);
+      break;
+    case CT_ADMIN_DUR_8:
+      g_hold_secs = 8; nvsSaveSettings();
+      Serial.println(F("Admin: hold duration → 8 s"));
+      blinkDurationConfirm(8);
+      break;
+  }
+  updateDisplays();
+}
+
+void saveGameState() {
+  savedState        = gameState;
+  savedPhaseStart   = phaseStart;
+  savedClaimingTo   = claimingToTeam;
+  savedClaimingFrom = claimingFromTeam;
+  memcpy(savedHeldUID, heldUID, sizeof(heldUID));
+  savedHeldUIDLen   = heldUIDLen;
+}
+
+void restoreGameState() {
+  gameState        = savedState;
+  phaseStart       = savedPhaseStart;
+  claimingToTeam   = savedClaimingTo;
+  claimingFromTeam = savedClaimingFrom;
+  memcpy(heldUID, savedHeldUID, sizeof(heldUID));
+  heldUIDLen       = savedHeldUIDLen;
+}
+
 void handleCard() {
   unsigned long now = millis();
   if (now - lastCardMillis < 500) return;
   lastCardMillis = now;
 
-  if (cardMatchAny(CT_ADMIN)) { resetGame(); beepReset(); playStatusVoice(); return; }
+  // Admin RESET — immediate tap, works in any non-hold state
+  if (cardMatchAny(CT_ADMIN_RESET)) {
+    resetGame(); beepReset(); playStatusVoice(); return;
+  }
 
+  // Admin hold cards — save game state, enter ADMIN_HOLD for 3 s
+  static const uint8_t adminHoldTypes[] = {
+    CT_ADMIN_RED_PLUS, CT_ADMIN_RED_MINUS,
+    CT_ADMIN_BLUE_PLUS, CT_ADMIN_BLUE_MINUS,
+    CT_ADMIN_DUR_2, CT_ADMIN_DUR_5, CT_ADMIN_DUR_8
+  };
+  for (uint8_t i = 0; i < 7; i++) {
+    if (cardMatchAny(adminHoldTypes[i])) {
+      saveGameState();
+      adminCardType   = adminHoldTypes[i];
+      adminActionDone = false;
+      phaseStart      = now;
+      gameState       = ADMIN_HOLD;
+      saveHeld();
+      beepCardAccepted();
+      return;
+    }
+  }
+
+  // Regular game card handling
   bool actionTaken = false;
 
   switch (gameState) {
-
     case NEUTRAL:
       if      (cardMatchAny(CT_RED_CLAIM))  { startClaim(1); actionTaken = true; }
       else if (cardMatchAny(CT_BLUE_CLAIM)) { startClaim(2); actionTaken = true; }
@@ -550,13 +653,12 @@ void showSettingsMenu() {
   dhr();
   Serial.println(F("  Settings"));
   dhr();
-  Serial.print(F("  1  Capture time      ")); Serial.print(g_capture_secs);    Serial.println(F(" s"));
-  Serial.print(F("  2  Claim time        ")); Serial.print(g_claim_secs);      Serial.println(F(" s"));
-  Serial.print(F("  3  Post-score lock   ")); Serial.print(g_post_score_secs); Serial.println(F(" s"));
-  Serial.print(F("  4  LED count         ")); Serial.println(g_num_leds);
-  Serial.print(F("  5  LED brightness    ")); Serial.println(g_brightness);
-  Serial.print(F("  6  Card timeout      ")); Serial.print(g_card_timeout_ms); Serial.println(F(" ms"));
-  Serial.print(F("  7  Poll interval     ")); Serial.print(g_poll_ms);         Serial.println(F(" ms"));
+  Serial.print(F("  Hold duration        ")); Serial.print(g_hold_secs);       Serial.println(F(" s  (set by admin card)"));
+  Serial.print(F("  1  Post-score lock   ")); Serial.print(g_post_score_secs); Serial.println(F(" s"));
+  Serial.print(F("  2  LED count         ")); Serial.println(g_num_leds);
+  Serial.print(F("  3  LED brightness    ")); Serial.println(g_brightness);
+  Serial.print(F("  4  Card timeout      ")); Serial.print(g_card_timeout_ms); Serial.println(F(" ms"));
+  Serial.print(F("  5  Poll interval     ")); Serial.print(g_poll_ms);         Serial.println(F(" ms"));
   Serial.println(F("  0  Back"));
   hr();
   Serial.print(F("  > "));
@@ -564,12 +666,14 @@ void showSettingsMenu() {
 
 void showCardsMenu() {
   menuState = MS_CARDS;
+  inputBuf  = "";
   Serial.println();
   dhr();
-  Serial.println(F("  Cards"));
+  Serial.println(F("  Cards  (enter number + Enter, 0 = back)"));
   dhr();
   for (uint8_t i = 0; i < NUM_CARD_TYPES; i++) {
     Serial.print(F("  "));
+    if (i + 1 < 10) Serial.print(' ');
     Serial.print(i + 1);
     Serial.print(F("  "));
     Serial.print(TYPE_NAMES[i]);
@@ -577,7 +681,7 @@ void showCardsMenu() {
     Serial.print(g_card_count[i]);
     Serial.println(F(" cards)"));
   }
-  Serial.println(F("  0  Back"));
+  Serial.println(F("   0  Back"));
   hr();
   Serial.print(F("  > "));
 }
@@ -635,14 +739,14 @@ void menuHandleInput(char c) {
       break;
 
     case MS_SETTINGS:
-      if (c >= '1' && c <= '7') {
+      if (c >= '1' && c <= '5') {
         menuParam = c - '0';
         menuState = MS_SETTINGS_EDIT;
         inputBuf  = "";
-        while (Serial.available()) Serial.read();  // discard trailing \n from menu selection
+        while (Serial.available()) Serial.read();
         const char* labels[] = {
-          "Capture secs", "Claim secs", "Post-score secs",
-          "LED count", "LED brightness", "Card timeout ms", "Poll interval ms"
+          "Post-score secs", "LED count", "LED brightness",
+          "Card timeout ms", "Poll interval ms"
         };
         Serial.print(F("\n  "));
         Serial.print(labels[menuParam - 1]);
@@ -657,21 +761,18 @@ void menuHandleInput(char c) {
         if (inputBuf.length() > 0) {
           uint16_t v = (uint16_t)inputBuf.toInt();
           switch (menuParam) {
-            case 1: g_capture_secs    = (uint8_t)(v < 1 ? 1 : v > 255 ? 255 : v); break;
-            case 2: g_claim_secs      = (uint8_t)(v < 1 ? 1 : v > 255 ? 255 : v); break;
-            case 3: g_post_score_secs = (uint8_t)(v < 1 ? 1 : v > 255 ? 255 : v); break;
-            case 4: g_num_leds        = (uint8_t)(v < 1 ? 1 : v > MAX_LEDS ? MAX_LEDS : v); break;
-            case 5: g_brightness      = (uint8_t)(v > 255 ? 255 : v);
+            case 1: g_post_score_secs = (uint8_t)(v < 1 ? 1 : v > 255 ? 255 : v); break;
+            case 2: g_num_leds        = (uint8_t)(v < 1 ? 1 : v > MAX_LEDS ? MAX_LEDS : v); break;
+            case 3: g_brightness      = (uint8_t)(v > 255 ? 255 : v);
                     FastLED.setBrightness(g_brightness); break;
-            case 6: g_card_timeout_ms = (v < 100 ? 100 : v > 9999 ? 9999 : v); break;
-            case 7: g_poll_ms         = (v < 20  ? 20  : v > 1000 ? 1000 : v); break;
+            case 4: g_card_timeout_ms = (v < 100 ? 100 : v > 9999 ? 9999 : v); break;
+            case 5: g_poll_ms         = (v < 20  ? 20  : v > 1000 ? 1000 : v); break;
           }
           nvsSaveSettings();
           Serial.println();
           Serial.println(F("  Saved."));
           showSettingsMenu();
         }
-        // empty newline (stray \n) → stay in edit mode, ignore
       } else if (isDigit(c) && inputBuf.length() < 5) {
         inputBuf += c;
         Serial.print(c);
@@ -679,10 +780,20 @@ void menuHandleInput(char c) {
       break;
 
     case MS_CARDS:
-      if (c >= '1' && c <= '0' + NUM_CARD_TYPES) {
-        showScanMenu(c - '1');
-      } else if (c == '0') {
+      if (c == '0' && inputBuf.length() == 0) {
         showMainMenu();
+      } else if (isDigit(c) && inputBuf.length() < 2) {
+        inputBuf += c;
+        Serial.print(c);
+      } else if ((c == '\n' || c == '\r') && inputBuf.length() > 0) {
+        uint8_t sel = (uint8_t)inputBuf.toInt();
+        inputBuf = "";
+        if (sel >= 1 && sel <= NUM_CARD_TYPES) {
+          showScanMenu(sel - 1);
+        } else {
+          Serial.println(F("\n  Invalid — enter 1–12."));
+          showCardsMenu();
+        }
       }
       break;
 
@@ -743,8 +854,8 @@ void setup() {
   Serial.begin(115200);
 
   dfSerial.begin(9600, SERIAL_8N1, PIN_DFP_RX, PIN_DFP_TX);
-  delay(1000);  // DFPlayer needs time to boot before first command
-  if (dfPlayer.begin(dfSerial, false)) {  // false = no ACK (needed for most clones)
+  delay(1000);
+  if (dfPlayer.begin(dfSerial, false)) {
     dfPlayer.volume(DFPLAYER_VOL);
     dfPlayer.outputDevice(DFPLAYER_DEVICE_SD);
     dfPlayerReady = true;
@@ -768,7 +879,6 @@ void setup() {
   disp.begin();
   disp.setBrightness(BRIGHT_HIGH);
 
-  // Load or initialize NVS
   prefs.begin("ko", true);
   bool initialized = prefs.getBool("init", false);
   prefs.end();
@@ -783,7 +893,6 @@ void setup() {
 
   FastLED.setBrightness(g_brightness);
 
-  // Hardware test
   Serial.println(F("Hardware test..."));
   disp.showNumber(888888);
   fill_solid(leds, g_num_leds, CRGB::Red);   FastLED.show(); delay(500);
@@ -823,10 +932,35 @@ void loop() {
 
   // ── Game mode ─────────────────────────────────────────────
   bool holdState = (gameState == CLAIMING      ||
-                    gameState == RED_CAPTURING ||
+                    gameState == RED_CAPTURING  ||
                     gameState == BLUE_CAPTURING);
 
-  // Card hold tracking
+  // Admin hold: poll admin card; after 3 s execute action; wait for card to leave
+  if (gameState == ADMIN_HOLD && now - lastPollTime >= g_poll_ms) {
+    lastPollTime = now;
+    bool here = pollHeldCard();
+    if (adminActionDone) {
+      if (here) {
+        lastCardSeen = now;
+      } else if (now - lastCardSeen > g_card_timeout_ms) {
+        restoreGameState();  // card is gone — resume game
+      }
+    } else {
+      if (here) {
+        lastCardSeen = now;
+        if (now - phaseStart >= 3000UL) {
+          executeAdminHold();
+          adminActionDone = true;
+          lastCardSeen    = now;
+        }
+      } else if (now - lastCardSeen > g_card_timeout_ms) {
+        restoreGameState();  // card removed before 3 s — cancel
+        beepAborted();
+      }
+    }
+  }
+
+  // Team card hold tracking (CLAIMING / CAPTURING)
   if (holdState && now - lastPollTime >= g_poll_ms) {
     lastPollTime = now;
     if (pollHeldCard()) {
@@ -846,7 +980,7 @@ void loop() {
 
   // Claim complete → claimed
   if (gameState == CLAIMING &&
-      now - phaseStart >= (unsigned long)g_claim_secs * 1000) {
+      now - phaseStart >= (unsigned long)g_hold_secs * 1000) {
     gameState  = (claimingToTeam == 1) ? CLAIMED_RED : CLAIMED_BLUE;
     phaseStart = now;
     heldUIDLen = 0;
@@ -856,19 +990,19 @@ void loop() {
 
   // Capture complete → score
   if ((gameState == RED_CAPTURING || gameState == BLUE_CAPTURING) &&
-      now - phaseStart >= (unsigned long)g_capture_secs * 1000)
+      now - phaseStart >= (unsigned long)g_hold_secs * 1000)
     scorePoint(gameState == RED_CAPTURING ? 1 : 2);
 
   // Post-score → neutral
   if (gameState == POST_SCORE &&
       now - phaseStart >= (unsigned long)g_post_score_secs * 1000) {
-    gameState  = NEUTRAL;
-    phaseStart = now;
-    lastVoiceMs = now;  // delay next periodic so neutral doesn't fire right after a score
+    gameState   = NEUTRAL;
+    phaseStart  = now;
+    lastVoiceMs = now;
   }
 
-  // New card scan (only when not holding)
-  if (!holdState) {
+  // New card scan (not while any card is being held)
+  if (!holdState && gameState != ADMIN_HOLD) {
     if (rfid.PICC_IsNewCardPresent() && rfid.PICC_ReadCardSerial()) {
       handleCard();
       if (heldUIDLen == 0) {
@@ -878,7 +1012,7 @@ void loop() {
     }
   }
 
-  // Periodic lead/status announcement every 3 minutes
+  // Periodic status announcement every 30 s
   if (!inMenu && now - lastVoiceMs >= 30000UL)
     playLeadVoice();
 

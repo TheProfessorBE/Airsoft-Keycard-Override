@@ -14,7 +14,7 @@ const CardDef BLUE_CLAIM_CARDS[] = {
   {{ 0x97,0xC6,0x7A,0x33 }, 4},
 };
 
-const CardDef BLUE_CAPTURE_CARDS[] = {
+const CardDef BLUE_CAPTURE_CARDS[] = {how 
   {{ 0x3A,0x65,0x0B,0x35 }, 4},
 };
 

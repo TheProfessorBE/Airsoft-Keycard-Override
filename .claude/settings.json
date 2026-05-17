@@ -6,7 +6,11 @@
       "Read(//c/Dropbox/Projects/Airsoft/2026 - Hack The Powerplant/**)",
       "Bash(git add *)",
       "Bash(git update-index *)",
-      "Bash(git hash-object *)"
+      "Bash(git hash-object *)",
+      "Read(//c/Dropbox/Projects/Airsoft/2026 - AudioLibrary/**)"
+    ],
+    "additionalDirectories": [
+      "C:\\Dropbox\\Projects\\Airsoft\\2026 - AudioLibrary"
     ]
   }
 }

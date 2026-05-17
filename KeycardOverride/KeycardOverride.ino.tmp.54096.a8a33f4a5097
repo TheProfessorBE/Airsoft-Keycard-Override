@@ -404,12 +404,12 @@ void playStatusVoice() {
   if (!dfPlayerReady) return;
   lastVoiceMs = millis();
   switch (gameState) {
-    case NEUTRAL:       audio.playRandom(AudioClip::THE_TERMINAL_IS_NEUTRAL);                break;
-    case CLAIMED_RED:   audio.playRandom(AudioClip::THE_TERMINAL_IS_CLAIMED_BY_THE_RED_TEAM);  break;
-    case CLAIMED_BLUE:  audio.playRandom(AudioClip::THE_TERMINAL_IS_CLAIMED_BY_THE_BLUE_TEAM); break;
+    case NEUTRAL:       audio.playRandom(AudioClip::TERMINAL_IS_NEUTRAL);           break;
+    case CLAIMED_RED:   audio.playRandom(AudioClip::TERMINAL_CLAIMED_BY_RED_TEAM);  break;
+    case CLAIMED_BLUE:  audio.playRandom(AudioClip::TERMINAL_CLAIMED_BY_BLUE_TEAM); break;
     case POST_SCORE:
-      if (lastScorer == 1) audio.playRandom(AudioClip::THE_TERMINAL_IS_CAPTURED_BY_THE_RED_TEAM);
-      else                 audio.playRandom(AudioClip::THE_TERMINAL_IS_CAPTURED_BY_THE_BLUE_TEAM);
+      if (lastScorer == 1) audio.playRandom(AudioClip::TERMINAL_CAPTURED_BY_RED_TEAM);
+      else                 audio.playRandom(AudioClip::TERMINAL_CAPTURED_BY_BLUE_TEAM);
       break;
     default: break;
   }
@@ -418,17 +418,10 @@ void playStatusVoice() {
 void playLeadVoice() {
   if (!dfPlayerReady) return;
   lastVoiceMs = millis();
-  switch (gameState) {
-    case CLAIMED_RED:
-    case RED_CAPTURING:
-      audio.playRandom(AudioClip::THE_TERMINAL_IS_CLAIMED_BY_THE_RED_TEAM);  break;
-    case CLAIMED_BLUE:
-    case BLUE_CAPTURING:
-      audio.playRandom(AudioClip::THE_TERMINAL_IS_CLAIMED_BY_THE_BLUE_TEAM); break;
-    case NEUTRAL:
-      audio.playRandom(AudioClip::THE_TERMINAL_IS_NEUTRAL); break;
-    default: break;
-  }
+  // TODO: swap back to KO clips once TTS files are generated (0001-0016)
+  if      (redScore > blueScore) audio.playRandom(AudioClip::RED_TEAM_HAS_THE_HARDPOINT);
+  else if (blueScore > redScore) audio.playRandom(AudioClip::BLUE_TEAM_HAS_THE_HARDPOINT);
+  else if (redScore > 0)         audio.playRandom(AudioClip::RED_TEAM_HAS_THE_HARDPOINT);
 }
 
 // ════════════════════════════════════════════════════════════════
@@ -864,7 +857,6 @@ void loop() {
       now - phaseStart >= (unsigned long)g_post_score_secs * 1000) {
     gameState  = NEUTRAL;
     phaseStart = now;
-    lastVoiceMs = now;  // delay next periodic so neutral doesn't fire right after a score
   }
 
   // New card scan (only when not holding)
@@ -879,8 +871,11 @@ void loop() {
   }
 
   // Periodic lead/status announcement every 3 minutes
-  if (!inMenu && now - lastVoiceMs >= 30000UL)
+  if (!inMenu && now - lastVoiceMs >= 10000UL) {
+    Serial.print(F("timer triggered, now="));  Serial.print(now);
+    Serial.print(F(" lastVoiceMs="));          Serial.println(lastVoiceMs);
     playLeadVoice();
+  }
 
   updateLEDs();
   updateDisplays();
